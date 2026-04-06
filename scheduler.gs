@@ -1112,13 +1112,19 @@ For more details, see the documentation files.`;
 }
 
 /**
- * Optimize Day/Night Balance - Swap residents to balance distribution
+ * Optimize Day/Night Balance - Smart rebalancing algorithm
  */
 function optimizeDayNightBalance() {
   const ui = SpreadsheetApp.getUi();
   const result = ui.alert(
     'Optimize Day/Night Balance',
-    'This will analyze the schedule and attempt to swap residents between day and night shifts to improve balance. Continue?',
+    'This will automatically rebalance the schedule:\n\n' +
+    '• Move shifts from high days (3+) to low days (0-1)\n' +
+    '• Fix duplicate shift types (OLY site only)\n' +
+    '• Maintain minimum 4 shifts/day (2 day + 2 night)\n' +
+    '• Respect Wednesday constraint (nights only)\n' +
+    '• Extra effort on Day 1\n\n' +
+    'Continue?',
     ui.ButtonSet.YES_NO
   );
   
@@ -1148,80 +1154,102 @@ function optimizeDayNightBalance() {
       return;
     }
     
-    Logger.log('Found ' + problemDays.length + ' problem days: ' + problemDays.map(d => d.index).join(', '));
+    Logger.log('=== SMART REBALANCING ALGORITHM (CORRECTED) ===');
+    Logger.log('Initial problem days: ' + problemDays.length);
     
-    // PHASE 1: Try shift redistribution (move individual shifts from front to back)
-    Logger.log('=== PHASE 1: Attempting shift redistribution ===');
-    const shiftMoves = findShiftRedistributionMoves(residents, dates, currentDistribution, problemDays);
+    const optimizationLog = [];
+    let totalMovesApplied = 0;
+    let currentDist = JSON.parse(JSON.stringify(currentDistribution));
     
-    if (shiftMoves.length > 0) {
-      // Sort by improvement score
-      shiftMoves.sort((a, b) => b.improvement - a.improvement);
-      const bestMove = shiftMoves[0];
+    // Run optimization in multiple passes
+    const maxPasses = 10;
+    for (let pass = 1; pass <= maxPasses; pass++) {
+      Logger.log('\n=== PASS ' + pass + ' ===');
       
-      if (bestMove.improvement > 0) {
-        const message = `Found shift redistribution opportunity!\n\n` +
-          `Move: ${bestMove.resident.name}\n` +
-          `From: Day ${bestMove.fromDay} (${bestMove.fromShift}) → Day ${bestMove.toDay} (${bestMove.toShift})\n\n` +
-          `Day ${bestMove.fromDay}: ${bestMove.fromDayBefore.dayShifts}/${bestMove.fromDayBefore.nightShifts} → ${bestMove.fromDayAfter.dayShifts}/${bestMove.fromDayAfter.nightShifts}\n` +
-          `Day ${bestMove.toDay}: ${bestMove.toDayBefore.dayShifts}/${bestMove.toDayBefore.nightShifts} → ${bestMove.toDayAfter.dayShifts}/${bestMove.toDayAfter.nightShifts}\n\n` +
-          `Problem days before: ${problemDays.length}\n` +
-          `Problem days after: ${bestMove.problemDaysAfter}\n` +
-          `Improvement score: +${bestMove.improvement.toFixed(1)}\n\n` +
-          `Apply this shift move?`;
-        
-        const confirmResult = ui.alert('Optimization Found (Shift Move)', message, ui.ButtonSet.YES_NO);
-        
-        if (confirmResult === ui.Button.YES) {
-          applyShiftMove(sheet, bestMove);
-          ui.alert('Success', 'Shift move applied successfully! Please review the updated schedule.', ui.ButtonSet.OK);
-          return;
+      // Recalculate problem days
+      const problems = identifyProblemDays(currentDist);
+      if (problems.length === 0) {
+        Logger.log('All problems resolved!');
+        break;
+      }
+      
+      Logger.log('Problem days remaining: ' + problems.length);
+      
+      // STRATEGY 1: Day 1 Special Handling (highest priority)
+      if (currentDist[0] && !currentDist[0].isBalanced && currentDist[0].nightShifts > 2) {
+        Logger.log('[DAY 1] Attempting to fix Day 1 (current: ' + currentDist[0].dayShifts + '/' + currentDist[0].nightShifts + ')');
+        const day1Move = findDay1ReductionMove(residents, dates, currentDist, sheet);
+        if (day1Move) {
+          applyMoveToSheet(sheet, day1Move);
+          currentDist = updateDistributionAfterMove(currentDist, day1Move);
+          optimizationLog.push('[DAY 1] ' + day1Move.description);
+          totalMovesApplied++;
+          Logger.log('Applied Day 1 move: ' + day1Move.description);
+          continue;
+        } else {
+          Logger.log('[DAY 1] No valid moves found (likely blocked by PTO/Requests or minimum coverage)');
         }
+      }
+      
+      // STRATEGY 2: Fix duplicate shift types (OLY site only)
+      const duplicateMove = findDuplicateShiftMove(residents, dates, currentDist, problems, sheet);
+      if (duplicateMove) {
+        applyMoveToSheet(sheet, duplicateMove);
+        currentDist = updateDistributionAfterMove(currentDist, duplicateMove);
+        optimizationLog.push('[DUPLICATE] ' + duplicateMove.description);
+        totalMovesApplied++;
+        Logger.log('Applied duplicate fix: ' + duplicateMove.description);
+        continue;
+      }
+      
+      // STRATEGY 3: Move from high to low
+      const balanceMove = findHighToLowMove(residents, dates, currentDist, problems, sheet);
+      if (balanceMove) {
+        applyMoveToSheet(sheet, balanceMove);
+        currentDist = updateDistributionAfterMove(currentDist, balanceMove);
+        optimizationLog.push('[BALANCE] ' + balanceMove.description);
+        totalMovesApplied++;
+        Logger.log('Applied balance move: ' + balanceMove.description);
+        continue;
+      }
+      
+      // No moves found, stop
+      Logger.log('No valid moves found in this pass');
+      break;
+    }
+    
+    // Final analysis
+    loadCurrentSchedule(sheet, residents);
+    const finalDistribution = analyzeDayNightDistribution(residents, dates);
+    const finalProblems = identifyProblemDays(finalDistribution);
+    
+    let message = 'Optimization Complete!\n\n';
+    message += 'Moves applied: ' + totalMovesApplied + '\n';
+    message += 'Problem days before: ' + problemDays.length + '\n';
+    message += 'Problem days after: ' + finalProblems.length + '\n\n';
+    
+    if (finalProblems.length > 0) {
+      message += 'Remaining issues:\n';
+      for (let p of finalProblems) {
+        message += '  Day ' + p.index + ': ' + p.dayShifts + '/' + p.nightShifts;
+        if (p.index === 0) {
+          message += ' (limited by PTO/Requests)';
+        }
+        message += '\n';
+      }
+    } else {
+      message += 'All distribution issues resolved! ✓';
+    }
+    
+    message += '\n\nChanges made:\n';
+    if (optimizationLog.length > 0) {
+      message += optimizationLog.slice(0, 10).join('\n');
+      if (optimizationLog.length > 10) {
+        message += '\n... and ' + (optimizationLog.length - 10) + ' more';
       }
     }
     
-    Logger.log('No beneficial shift moves found. Trying full resident swaps...');
-    
-    // PHASE 2: Try full resident swaps (original logic)
-    Logger.log('=== PHASE 2: Attempting full resident swaps ===');
-    const swapCandidates = findSwapCandidates(residents, dates, currentDistribution);
-    
-    if (swapCandidates.length === 0) {
-      ui.alert('No Swaps Available', 'Could not find any valid resident swaps that would improve the distribution.', ui.ButtonSet.OK);
-      return;
-    }
-    
-    // Evaluate each swap
-    const evaluatedSwaps = evaluateSwaps(swapCandidates, residents, dates, currentDistribution);
-    
-    // Sort by improvement score
-    evaluatedSwaps.sort((a, b) => b.improvement - a.improvement);
-    
-    // Take the best swap
-    const bestSwap = evaluatedSwaps[0];
-    
-    if (bestSwap.improvement <= 0) {
-      ui.alert('No Improvement', 'Found potential swaps but none would improve the distribution.', ui.ButtonSet.OK);
-      return;
-    }
-    
-    // Show results to user
-    const message = `Found optimization opportunity!\n\n` +
-      `Swap: ${bestSwap.residentA.name} ↔ ${bestSwap.residentB.name}\n\n` +
-      `${bestSwap.residentA.name}: ${bestSwap.residentA.nightShiftCount} nights → ${bestSwap.residentB.nightShiftCount} nights\n` +
-      `${bestSwap.residentB.name}: ${bestSwap.residentB.nightShiftCount} nights → ${bestSwap.residentA.nightShiftCount} nights\n\n` +
-      `Problem days before: ${problemDays.length}\n` +
-      `Problem days after: ${bestSwap.problemDaysAfter}\n` +
-      `Improvement score: +${bestSwap.improvement.toFixed(1)}\n\n` +
-      `Apply this swap?`;
-    
-    const confirmResult = ui.alert('Optimization Found (Resident Swap)', message, ui.ButtonSet.YES_NO);
-    
-    if (confirmResult === ui.Button.YES) {
-      // Apply the swap
-      applySwap(sheet, bestSwap.residentA, bestSwap.residentB);
-      ui.alert('Success', 'Swap applied successfully! Please review the updated schedule.', ui.ButtonSet.OK);
-    }
+    ui.alert('Optimization Complete', message, ui.ButtonSet.OK);
     
   } catch (error) {
     ui.alert('Error', 'Optimization failed: ' + error.message, ui.ButtonSet.OK);
@@ -1229,6 +1257,376 @@ function optimizeDayNightBalance() {
     Logger.log(error.stack);
   }
 }
+
+/**
+ * Helper: Check if a day is Wednesday
+ */
+function isWednesday(dayIndex, dates) {
+  if (dayIndex < 0 || dayIndex >= dates.length) return false;
+  const dayName = String(dates[dayIndex].dayName).toLowerCase().trim();
+  return dayName === 'wed' || dayName === 'wednesday' || dayName.startsWith('wed');
+}
+
+/**
+ * Helper: Get only OLY residents
+ */
+function getOlyResidents(residents) {
+  return residents.filter(r => r.site === 'Oly');
+}
+
+/**
+ * Helper: Check if removing a shift would drop below minimum coverage
+ */
+function wouldDropBelowMinimum(dayIndex, shiftToRemove, sheet, residents, dates) {
+  const olyResidents = getOlyResidents(residents);
+  const isWed = isWednesday(dayIndex, dates);
+  
+  // Count current shifts on this day (OLY only)
+  let dayShifts = 0;
+  let nightShifts = 0;
+  
+  for (let resident of olyResidents) {
+    const dayCol = CONFIG.FIRST_DAY_COL + dayIndex;
+    const shift = sheet.getRange(resident.row, dayCol).getValue();
+    
+    if (!shift || shift === 'PTO' || shift === 'Request') continue;
+    
+    if (['S1', 'S2', 'S3'].includes(shift)) {
+      dayShifts++;
+    } else if (['S4', 'S5'].includes(shift)) {
+      nightShifts++;
+    }
+  }
+  
+  // Check if removing this shift drops below minimum
+  const isDayShift = ['S1', 'S2', 'S3'].includes(shiftToRemove);
+  const isNightShift = ['S4', 'S5'].includes(shiftToRemove);
+  
+  if (isWed) {
+    // Wednesday: minimum 2 night shifts, 0 day shifts
+    if (isNightShift && nightShifts - 1 < 2) return true;
+  } else {
+    // Regular day: minimum 2 day + 2 night
+    if (isDayShift && dayShifts - 1 < 2) return true;
+    if (isNightShift && nightShifts - 1 < 2) return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Strategy 1: Find move to reduce night shifts on Day 1
+ */
+function findDay1ReductionMove(residents, dates, currentDist, sheet) {
+  const olyResidents = getOlyResidents(residents);
+  
+  // Find residents working night shift on Day 1
+  for (let resident of olyResidents) {
+    const day1Col = CONFIG.FIRST_DAY_COL + 0;
+    const shift = sheet.getRange(resident.row, day1Col).getValue();
+    
+    if (!CONFIG.NIGHT_SHIFTS.includes(shift)) continue;
+    if (resident.ptoRequests[0]) continue;
+    
+    // Check if removing this shift drops below minimum
+    if (wouldDropBelowMinimum(0, shift, sheet, residents, dates)) {
+      Logger.log('  Cannot remove ' + resident.name + ' from Day 0 - would drop below minimum');
+      continue;
+    }
+    
+    // Try moving to days 7-28 that need night shifts
+    for (let targetDay = 6; targetDay < dates.length; targetDay++) {
+      if (resident.ptoRequests[targetDay]) continue;
+      if (sheet.getRange(resident.row, CONFIG.FIRST_DAY_COL + targetDay).getValue()) continue;
+      
+      const targetDist = currentDist[targetDay];
+      if (targetDist.nightShifts >= targetDist.dayShifts) continue; // Only move to low-night days
+      
+      // Validate constraints
+      if (!validateMoveConstraints(resident, 0, targetDay, shift, dates, sheet, residents)) continue;
+      
+      return {
+        type: 'move',
+        resident: resident,
+        fromDay: 0,
+        toDay: targetDay,
+        shift: shift,
+        description: resident.name + ': Day 0→' + targetDay + ' (' + shift + ')'
+      };
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Strategy 2: Find duplicate shift types and change+move one (OLY site only)
+ */
+function findDuplicateShiftMove(residents, dates, currentDist, problems, sheet) {
+  const olyResidents = getOlyResidents(residents);
+  
+  for (let problem of problems) {
+    const day = problem.index;
+    
+    // Count shift types on this day (OLY ONLY)
+    const shiftCounts = {S1: 0, S2: 0, S3: 0, S4: 0, S5: 0};
+    const shiftResidents = {S1: [], S2: [], S3: [], S4: [], S5: []};
+    
+    for (let resident of olyResidents) {
+      const dayCol = CONFIG.FIRST_DAY_COL + day;
+      const shift = sheet.getRange(resident.row, dayCol).getValue();
+      if (shift && shiftCounts.hasOwnProperty(shift)) {
+        shiftCounts[shift]++;
+        shiftResidents[shift].push(resident);
+      }
+    }
+    
+    // Find duplicates (2+ of same shift type)
+    for (let shiftType in shiftCounts) {
+      if (shiftCounts[shiftType] < 2) continue;
+      
+      Logger.log('  Found duplicate ' + shiftType + ' on Day ' + day + ' (count: ' + shiftCounts[shiftType] + ')');
+      
+      // We have duplicates! Change one and move it
+      const resident = shiftResidents[shiftType][0];
+      
+      // Determine alternate shift type
+      let newShiftType;
+      if (shiftType === 'S5') newShiftType = 'S4';
+      else if (shiftType === 'S4') newShiftType = 'S5';
+      else if (shiftType === 'S2') newShiftType = 'S1';
+      else if (shiftType === 'S1') newShiftType = 'S2';
+      else continue;
+      
+      // Check if removing from source day drops below minimum
+      if (wouldDropBelowMinimum(day, shiftType, sheet, residents, dates)) {
+        Logger.log('  Cannot remove duplicate from Day ' + day + ' - would drop below minimum');
+        continue;
+      }
+      
+      // Find a day that needs this shift type
+      for (let targetProblem of problems) {
+        if (targetProblem.index === day) continue; // Different day
+        const targetDay = targetProblem.index;
+        const targetDist = currentDist[targetDay];
+        
+        // Check Wednesday constraint
+        const isDayShift = ['S1', 'S2', 'S3'].includes(newShiftType);
+        if (isWednesday(targetDay, dates) && isDayShift) {
+          Logger.log('  Cannot move ' + newShiftType + ' to Day ' + targetDay + ' - Wednesday constraint');
+          continue;
+        }
+        
+        // Check if target needs this shift type
+        const isNightShift = CONFIG.NIGHT_SHIFTS.includes(newShiftType);
+        if (isNightShift && targetDist.nightShifts >= targetDist.dayShifts) continue;
+        if (!isNightShift && targetDist.dayShifts >= targetDist.nightShifts) continue;
+        
+        // Check if resident can work target day
+        if (resident.ptoRequests[targetDay]) continue;
+        if (sheet.getRange(resident.row, CONFIG.FIRST_DAY_COL + targetDay).getValue()) continue;
+        
+        // Validate constraints for the move
+        if (!validateMoveConstraints(resident, day, targetDay, newShiftType, dates, sheet, residents)) continue;
+        
+        return {
+          type: 'duplicate',
+          resident: resident,
+          fromDay: day,
+          toDay: targetDay,
+          oldShift: shiftType,
+          newShift: newShiftType,
+          description: resident.name + ': Day ' + day + ' (' + shiftType + '→' + newShiftType + ')→Day ' + targetDay
+        };
+      }
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Strategy 3: Find high-to-low balance move (OLY site only)
+ */
+function findHighToLowMove(residents, dates, currentDist, problems, sheet) {
+  const olyResidents = getOlyResidents(residents);
+  
+  // Find high days (3+ of one type) and low days (0-1 of a type)
+  const highDays = problems.filter(p => p.dayShifts >= 3 || p.nightShifts >= 3);
+  const lowDays = problems.filter(p => p.dayShifts <= 1 || p.nightShifts <= 1);
+  
+  for (let highDay of highDays) {
+    const needToReduceNights = highDay.nightShifts > highDay.dayShifts;
+    const needToReduceDays = highDay.dayShifts > highDay.nightShifts;
+    
+    // Find residents on this day with the shift type we need to reduce (OLY only)
+    for (let resident of olyResidents) {
+      const dayCol = CONFIG.FIRST_DAY_COL + highDay.index;
+      const shift = sheet.getRange(resident.row, dayCol).getValue();
+      if (!shift || resident.ptoRequests[highDay.index]) continue;
+      
+      const isNight = CONFIG.NIGHT_SHIFTS.includes(shift);
+      if (needToReduceNights && !isNight) continue;
+      if (needToReduceDays && isNight) continue;
+      
+      // Check if removing drops below minimum
+      if (wouldDropBelowMinimum(highDay.index, shift, sheet, residents, dates)) {
+        Logger.log('  Cannot remove ' + shift + ' from Day ' + highDay.index + ' - would drop below minimum');
+        continue;
+      }
+      
+      // Find a low day that needs this shift type
+      for (let lowDay of lowDays) {
+        if (lowDay.index === highDay.index) continue;
+        
+        // Check Wednesday constraint
+        const isDayShift = ['S1', 'S2', 'S3'].includes(shift);
+        if (isWednesday(lowDay.index, dates) && isDayShift) {
+          Logger.log('  Cannot move ' + shift + ' to Day ' + lowDay.index + ' - Wednesday constraint');
+          continue;
+        }
+        
+        const needsNights = lowDay.nightShifts < lowDay.dayShifts;
+        const needsDays = lowDay.dayShifts < lowDay.nightShifts;
+        
+        if (isNight && !needsNights) continue;
+        if (!isNight && !needsDays) continue;
+        
+        // Check if resident can work low day
+        if (resident.ptoRequests[lowDay.index]) continue;
+        if (sheet.getRange(resident.row, CONFIG.FIRST_DAY_COL + lowDay.index).getValue()) continue;
+        
+        // Validate constraints
+        if (!validateMoveConstraints(resident, highDay.index, lowDay.index, shift, dates, sheet, residents)) continue;
+        
+        return {
+          type: 'balance',
+          resident: resident,
+          fromDay: highDay.index,
+          toDay: lowDay.index,
+          shift: shift,
+          description: resident.name + ': Day ' + highDay.index + '→' + lowDay.index + ' (' + shift + ')'
+        };
+      }
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Validate move constraints (PTO, 60-hour, consecutive day/night, Wednesday, minimum coverage)
+ */
+function validateMoveConstraints(resident, fromDay, toDay, shift, dates, sheet, allResidents) {
+  // Check PTO
+  if (resident.ptoRequests[fromDay] || resident.ptoRequests[toDay]) return false;
+  
+  // Check Wednesday constraint
+  const isDayShift = ['S1', 'S2', 'S3'].includes(shift);
+  if (isWednesday(toDay, dates) && isDayShift) {
+    return false; // Cannot move day shift to Wednesday
+  }
+  
+  // Check if removing from source drops below minimum
+  if (wouldDropBelowMinimum(fromDay, shift, sheet, allResidents, dates)) {
+    return false;
+  }
+  
+  // Build temp schedule
+  const tempSchedule = {};
+  for (let col = CONFIG.FIRST_DAY_COL; col <= CONFIG.LAST_DAY_COL; col++) {
+    const dayIdx = col - CONFIG.FIRST_DAY_COL;
+    const val = sheet.getRange(resident.row, col).getValue();
+    if (val && val !== 'PTO' && val !== 'Request') {
+      tempSchedule[dayIdx] = resident.site + '-' + val;
+    }
+  }
+  
+  // Apply the move
+  delete tempSchedule[fromDay];
+  tempSchedule[toDay] = resident.site + '-' + shift;
+  
+  // Check consecutive day/night conflicts
+  const isNight = CONFIG.NIGHT_SHIFTS.includes(shift);
+  
+  // Check day before toDay
+  if (toDay > 0 && tempSchedule[toDay - 1]) {
+    const prevShift = tempSchedule[toDay - 1].split('-')[1];
+    const isPrevNight = CONFIG.NIGHT_SHIFTS.includes(prevShift);
+    if ((isNight && !isPrevNight) || (!isNight && isPrevNight)) return false;
+  }
+  
+  // Check day after toDay
+  if (toDay < dates.length - 1 && tempSchedule[toDay + 1]) {
+    const nextShift = tempSchedule[toDay + 1].split('-')[1];
+    const isNextNight = CONFIG.NIGHT_SHIFTS.includes(nextShift);
+    if ((isNight && !isNextNight) || (!isNight && isNextNight)) return false;
+  }
+  
+  // Check 60-hour rule
+  const tempResident = {schedule: tempSchedule, ptoRequests: resident.ptoRequests};
+  for (let d = Math.min(fromDay, toDay); d <= Math.max(fromDay, toDay) + 6; d++) {
+    if (d >= 0 && d < dates.length) {
+      if (!check60HourRuleForSchedule(tempResident, d)) return false;
+    }
+  }
+  
+  return true;
+}
+
+/**
+ * Apply move to sheet
+ */
+function applyMoveToSheet(sheet, move) {
+  const fromCol = CONFIG.FIRST_DAY_COL + move.fromDay;
+  const toCol = CONFIG.FIRST_DAY_COL + move.toDay;
+  
+  if (move.type === 'duplicate') {
+    // Remove from source day and add to target day with new shift type
+    sheet.getRange(move.resident.row, fromCol).setValue('');
+    sheet.getRange(move.resident.row, toCol).setValue(move.newShift);
+  } else {
+    // Standard move
+    sheet.getRange(move.resident.row, fromCol).setValue('');
+    sheet.getRange(move.resident.row, toCol).setValue(move.shift);
+  }
+}
+
+/**
+ * Update distribution after a move
+ */
+function updateDistributionAfterMove(currentDist, move) {
+  const newDist = JSON.parse(JSON.stringify(currentDist));
+  
+  // Update fromDay
+  const fromShift = move.type === 'duplicate' ? move.oldShift : move.shift;
+  const isFromNight = CONFIG.NIGHT_SHIFTS.includes(fromShift);
+  if (isFromNight) {
+    newDist[move.fromDay].nightShifts--;
+  } else {
+    newDist[move.fromDay].dayShifts--;
+  }
+  newDist[move.fromDay].isBalanced = isDistributionBalanced(
+    newDist[move.fromDay].dayShifts,
+    newDist[move.fromDay].nightShifts
+  );
+  
+  // Update toDay
+  const toShift = move.type === 'duplicate' ? move.newShift : move.shift;
+  const isToNight = CONFIG.NIGHT_SHIFTS.includes(toShift);
+  if (isToNight) {
+    newDist[move.toDay].nightShifts++;
+  } else {
+    newDist[move.toDay].dayShifts++;
+  }
+  newDist[move.toDay].isBalanced = isDistributionBalanced(
+    newDist[move.toDay].dayShifts,
+    newDist[move.toDay].nightShifts
+  );
+  
+  return newDist;
+}
+
 
 /**
  * Load current schedule from sheet into resident objects
