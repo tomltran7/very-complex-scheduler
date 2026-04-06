@@ -1150,7 +1150,40 @@ function optimizeDayNightBalance() {
     
     Logger.log('Found ' + problemDays.length + ' problem days: ' + problemDays.map(d => d.index).join(', '));
     
-    // Find and evaluate potential swaps
+    // PHASE 1: Try shift redistribution (move individual shifts from front to back)
+    Logger.log('=== PHASE 1: Attempting shift redistribution ===');
+    const shiftMoves = findShiftRedistributionMoves(residents, dates, currentDistribution, problemDays);
+    
+    if (shiftMoves.length > 0) {
+      // Sort by improvement score
+      shiftMoves.sort((a, b) => b.improvement - a.improvement);
+      const bestMove = shiftMoves[0];
+      
+      if (bestMove.improvement > 0) {
+        const message = `Found shift redistribution opportunity!\n\n` +
+          `Move: ${bestMove.resident.name}\n` +
+          `From: Day ${bestMove.fromDay} (${bestMove.fromShift}) → Day ${bestMove.toDay} (${bestMove.toShift})\n\n` +
+          `Day ${bestMove.fromDay}: ${bestMove.fromDayBefore.dayShifts}/${bestMove.fromDayBefore.nightShifts} → ${bestMove.fromDayAfter.dayShifts}/${bestMove.fromDayAfter.nightShifts}\n` +
+          `Day ${bestMove.toDay}: ${bestMove.toDayBefore.dayShifts}/${bestMove.toDayBefore.nightShifts} → ${bestMove.toDayAfter.dayShifts}/${bestMove.toDayAfter.nightShifts}\n\n` +
+          `Problem days before: ${problemDays.length}\n` +
+          `Problem days after: ${bestMove.problemDaysAfter}\n` +
+          `Improvement score: +${bestMove.improvement.toFixed(1)}\n\n` +
+          `Apply this shift move?`;
+        
+        const confirmResult = ui.alert('Optimization Found (Shift Move)', message, ui.ButtonSet.YES_NO);
+        
+        if (confirmResult === ui.Button.YES) {
+          applyShiftMove(sheet, bestMove);
+          ui.alert('Success', 'Shift move applied successfully! Please review the updated schedule.', ui.ButtonSet.OK);
+          return;
+        }
+      }
+    }
+    
+    Logger.log('No beneficial shift moves found. Trying full resident swaps...');
+    
+    // PHASE 2: Try full resident swaps (original logic)
+    Logger.log('=== PHASE 2: Attempting full resident swaps ===');
     const swapCandidates = findSwapCandidates(residents, dates, currentDistribution);
     
     if (swapCandidates.length === 0) {
@@ -1182,7 +1215,7 @@ function optimizeDayNightBalance() {
       `Improvement score: +${bestSwap.improvement.toFixed(1)}\n\n` +
       `Apply this swap?`;
     
-    const confirmResult = ui.alert('Optimization Found', message, ui.ButtonSet.YES_NO);
+    const confirmResult = ui.alert('Optimization Found (Resident Swap)', message, ui.ButtonSet.YES_NO);
     
     if (confirmResult === ui.Button.YES) {
       // Apply the swap
@@ -1501,4 +1534,290 @@ function applySwap(sheet, residentA, residentB) {
   }
   
   Logger.log('Swapped schedules: ' + residentA.name + ' ↔ ' + residentB.name);
+}
+
+/**
+ * Find shift redistribution moves (move individual shifts from front to back)
+ * Focuses on days with minor imbalances (difference < 1 from optimal ratios)
+ */
+function findShiftRedistributionMoves(residents, dates, currentDistribution, problemDays) {
+  const moves = [];
+  const midpoint = Math.floor(dates.length / 2);
+  
+  Logger.log('Analyzing shift redistribution opportunities...');
+  Logger.log('Midpoint: day ' + midpoint);
+  
+  // Optimal ratios: 2/3, 3/2, 2/2, 3/3
+  const optimalRatios = [
+    {day: 2, night: 3},
+    {day: 3, night: 2},
+    {day: 2, night: 2},
+    {day: 3, night: 3}
+  ];
+  
+  // Find problem days in first half (source days)
+  const firstHalfProblems = problemDays.filter(d => d.index < midpoint);
+  
+  // Find problem days in second half (target days)
+  const secondHalfProblems = problemDays.filter(d => d.index >= midpoint);
+  
+  Logger.log('First half problems: ' + firstHalfProblems.length);
+  Logger.log('Second half problems: ' + secondHalfProblems.length);
+  
+  // Try moving shifts from first half problems to second half problems
+  for (let sourceDayInfo of firstHalfProblems) {
+    const sourceDay = sourceDayInfo.index;
+    const sourceDist = currentDistribution[sourceDay];
+    
+    // Determine what shift type we need to remove from source day
+    const needToRemoveNight = sourceDist.nightShifts > sourceDist.dayShifts;
+    const needToRemoveDay = sourceDist.dayShifts > sourceDist.nightShifts;
+    
+    Logger.log(`Day ${sourceDay}: ${sourceDist.dayShifts}/${sourceDist.nightShifts} - Need to remove ${needToRemoveNight ? 'night' : 'day'}`);
+    
+    // Find residents working this day
+    for (let resident of residents) {
+      if (!resident.schedule[sourceDay]) continue;
+      if (resident.ptoRequests[sourceDay]) continue;
+      
+      const sourceShift = resident.schedule[sourceDay].split('-')[1];
+      const isNightShift = CONFIG.NIGHT_SHIFTS.includes(sourceShift);
+      
+      // Skip if this shift doesn't help balance source day
+      if (needToRemoveNight && !isNightShift) continue;
+      if (needToRemoveDay && isNightShift) continue;
+      
+      // Try moving to each problem day in second half
+      for (let targetDayInfo of secondHalfProblems) {
+        const targetDay = targetDayInfo.index;
+        const targetDist = currentDistribution[targetDay];
+        
+        // Skip if resident already working target day
+        if (resident.schedule[targetDay]) continue;
+        if (resident.ptoRequests[targetDay]) continue;
+        
+        // Determine what shift type target day needs
+        const needsNight = targetDist.nightShifts < targetDist.dayShifts;
+        const needsDay = targetDist.dayShifts < targetDist.nightShifts;
+        
+        // Skip if this shift doesn't help target day
+        if (needsNight && !isNightShift) continue;
+        if (needsDay && isNightShift) continue;
+        
+        // Validate the move
+        const moveResult = validateShiftMove(resident, sourceDay, targetDay, sourceShift, dates, residents);
+        
+        if (!moveResult.valid) {
+          Logger.log(`  Move ${resident.name} ${sourceDay}→${targetDay} invalid: ${moveResult.reason}`);
+          continue;
+        }
+        
+        // Calculate improvement
+        const improvement = calculateShiftMoveImprovement(
+          residents, dates, currentDistribution, resident, sourceDay, targetDay, sourceShift, optimalRatios
+        );
+        
+        if (improvement.score > 0) {
+          Logger.log(`  ✓ Move ${resident.name} day ${sourceDay}→${targetDay} (${sourceShift}): +${improvement.score.toFixed(1)}`);
+          
+          moves.push({
+            resident: resident,
+            fromDay: sourceDay,
+            toDay: targetDay,
+            fromShift: sourceShift,
+            toShift: sourceShift, // Same shift type
+            improvement: improvement.score,
+            problemDaysAfter: improvement.problemDaysAfter,
+            fromDayBefore: improvement.fromDayBefore,
+            fromDayAfter: improvement.fromDayAfter,
+            toDayBefore: improvement.toDayBefore,
+            toDayAfter: improvement.toDayAfter
+          });
+        }
+      }
+    }
+  }
+  
+  Logger.log('Found ' + moves.length + ' valid shift redistribution moves');
+  return moves;
+}
+
+/**
+ * Validate if a shift move is allowed
+ */
+function validateShiftMove(resident, fromDay, toDay, shift, dates, allResidents) {
+  // Check PTO conflicts
+  if (resident.ptoRequests[fromDay] || resident.ptoRequests[toDay]) {
+    return {valid: false, reason: 'PTO conflict'};
+  }
+  
+  // Check if resident has shift on fromDay
+  if (!resident.schedule[fromDay]) {
+    return {valid: false, reason: 'No shift on source day'};
+  }
+  
+  // Check if resident already working toDay
+  if (resident.schedule[toDay]) {
+    return {valid: false, reason: 'Already working target day'};
+  }
+  
+  // Create temporary schedule for validation
+  const tempSchedule = JSON.parse(JSON.stringify(resident.schedule));
+  delete tempSchedule[fromDay];
+  tempSchedule[toDay] = `${resident.site}-${shift}`;
+  
+  // Check consecutive day conflicts (no day/night mixing)
+  const isNightShift = CONFIG.NIGHT_SHIFTS.includes(shift);
+  
+  // Check day before toDay
+  if (toDay > 0 && tempSchedule[toDay - 1]) {
+    const prevShift = tempSchedule[toDay - 1].split('-')[1];
+    const isPrevNight = CONFIG.NIGHT_SHIFTS.includes(prevShift);
+    
+    if (isNightShift && !isPrevNight) {
+      return {valid: false, reason: 'Day→night conflict (day before)'};
+    }
+    if (!isNightShift && isPrevNight) {
+      return {valid: false, reason: 'Night→day conflict (day before)'};
+    }
+  }
+  
+  // Check day after toDay
+  if (toDay < CONFIG.LAST_DAY_COL - CONFIG.FIRST_DAY_COL && tempSchedule[toDay + 1]) {
+    const nextShift = tempSchedule[toDay + 1].split('-')[1];
+    const isNextNight = CONFIG.NIGHT_SHIFTS.includes(nextShift);
+    
+    if (isNightShift && !isNextNight) {
+      return {valid: false, reason: 'Night→day conflict (day after)'};
+    }
+    if (!isNightShift && isNextNight) {
+      return {valid: false, reason: 'Day→night conflict (day after)'};
+    }
+  }
+  
+  // Check 60-hour rule with temporary schedule
+  const tempResident = JSON.parse(JSON.stringify(resident));
+  tempResident.schedule = tempSchedule;
+  
+  // Validate all days in the range
+  const minDay = Math.min(fromDay, toDay);
+  const maxDay = Math.max(fromDay, toDay);
+  
+  for (let day = minDay; day <= maxDay; day++) {
+    if (!check60HourRuleForSchedule(tempResident, day)) {
+      return {valid: false, reason: '60-hour rule violation'};
+    }
+  }
+  
+  return {valid: true};
+}
+
+/**
+ * Calculate improvement score for a shift move
+ */
+function calculateShiftMoveImprovement(residents, dates, currentDist, resident, fromDay, toDay, shift, optimalRatios) {
+  const isNightShift = CONFIG.NIGHT_SHIFTS.includes(shift);
+  
+  // Simulate the move
+  const newDistribution = JSON.parse(JSON.stringify(currentDist));
+  
+  // Remove from source day
+  if (isNightShift) {
+    newDistribution[fromDay].nightShifts--;
+  } else {
+    newDistribution[fromDay].dayShifts--;
+  }
+  
+  // Add to target day
+  if (isNightShift) {
+    newDistribution[toDay].nightShifts++;
+  } else {
+    newDistribution[toDay].dayShifts++;
+  }
+  
+  // Recalculate balance
+  newDistribution[fromDay].isBalanced = isDistributionBalanced(
+    newDistribution[fromDay].dayShifts,
+    newDistribution[fromDay].nightShifts
+  );
+  
+  newDistribution[toDay].isBalanced = isDistributionBalanced(
+    newDistribution[toDay].dayShifts,
+    newDistribution[toDay].nightShifts
+  );
+  
+  // Count problem days
+  const problemDaysBefore = currentDist.filter(d => !d.isBalanced).length;
+  const problemDaysAfter = newDistribution.filter(d => !d.isBalanced).length;
+  
+  // Calculate distance from optimal ratios
+  const fromDayDistBefore = getDistanceFromOptimal(
+    currentDist[fromDay].dayShifts,
+    currentDist[fromDay].nightShifts,
+    optimalRatios
+  );
+  
+  const fromDayDistAfter = getDistanceFromOptimal(
+    newDistribution[fromDay].dayShifts,
+    newDistribution[fromDay].nightShifts,
+    optimalRatios
+  );
+  
+  const toDayDistBefore = getDistanceFromOptimal(
+    currentDist[toDay].dayShifts,
+    currentDist[toDay].nightShifts,
+    optimalRatios
+  );
+  
+  const toDayDistAfter = getDistanceFromOptimal(
+    newDistribution[toDay].dayShifts,
+    newDistribution[toDay].nightShifts,
+    optimalRatios
+  );
+  
+  // Improvement score: reduction in problem days + reduction in distance from optimal
+  const problemDayImprovement = (problemDaysBefore - problemDaysAfter) * 10;
+  const distanceImprovement = (fromDayDistBefore + toDayDistBefore) - (fromDayDistAfter + toDayDistAfter);
+  
+  const totalScore = problemDayImprovement + distanceImprovement;
+  
+  return {
+    score: totalScore,
+    problemDaysAfter: problemDaysAfter,
+    fromDayBefore: currentDist[fromDay],
+    fromDayAfter: newDistribution[fromDay],
+    toDayBefore: currentDist[toDay],
+    toDayAfter: newDistribution[toDay]
+  };
+}
+
+/**
+ * Get distance from optimal ratios (2/3, 3/2, 2/2, 3/3)
+ */
+function getDistanceFromOptimal(dayShifts, nightShifts, optimalRatios) {
+  let minDistance = 999;
+  
+  for (let ratio of optimalRatios) {
+    const distance = Math.abs(dayShifts - ratio.day) + Math.abs(nightShifts - ratio.night);
+    minDistance = Math.min(minDistance, distance);
+  }
+  
+  return minDistance;
+}
+
+/**
+ * Apply a shift move to the sheet
+ */
+function applyShiftMove(sheet, move) {
+  const resident = move.resident;
+  const fromCol = CONFIG.FIRST_DAY_COL + move.fromDay;
+  const toCol = CONFIG.FIRST_DAY_COL + move.toDay;
+  
+  // Clear source day
+  sheet.getRange(resident.row, fromCol).setValue('');
+  
+  // Set target day
+  sheet.getRange(resident.row, toCol).setValue(move.toShift);
+  
+  Logger.log(`Applied shift move: ${resident.name} day ${move.fromDay}→${move.toDay} (${move.toShift})`);
 }
