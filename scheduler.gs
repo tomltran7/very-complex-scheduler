@@ -569,10 +569,11 @@ function assignAdditionalShiftsBalanced(residents, date, schedule, isWednesday) 
   const site = 'Oly';
   
   // Define shift targets for additional assignments
+  // Pass 1: S2(1), S5(2) - Pass 2 adds: S2(+2), S5(+1) for balanced S2(3)/S5(3)
   const targets = {
-    S2: isWednesday ? 0 : 4,  // Total target (already has 1 from Pass 1)
-    S5: 2,                     // Total target (already has 1 from Pass 1)
-    S3: isWednesday ? 0 : 3    // Total target (0 from Pass 1)
+    S2: isWednesday ? 0 : 3,  // Total target 3 (already has 1 from Pass 1, add 2 more)
+    S5: 3,                     // Total target 3 (already has 2 from Pass 1, add 1 more)
+    S3: isWednesday ? 0 : 2    // Total target 2 (0 from Pass 1, add 2)
   };
   
   // Round-robin through shift types until all are at target or no eligible residents
