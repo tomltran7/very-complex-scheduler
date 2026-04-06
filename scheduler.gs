@@ -426,9 +426,10 @@ function distributeDay0Shifts(residents, date, schedule) {
     Logger.log('Day 0: Assigned ' + s4Candidate.name + ' (' + s4Candidate.classType + ') to S4 (night worker)');
   }
   
-  // S5: Assign 2 residents - balance classes (avoid all PGY3)
+  // S5: Assign 4 residents to create larger night worker pool
+  // This balances pool sizes with shift demands (S5 max 4/day vs S2 max 4/day)
   let s5Count = 0;
-  const s5Needed = 2;
+  const s5Needed = 4;
   
   // Try to get one from each remaining class for balance
   const nightClasses = new Set();
@@ -627,9 +628,9 @@ function assignNightShiftsMinimum(residents, date, schedule) {
     assignResidentToShift(s4Eligible, date, site, 'S4', schedule);
   }
   
-  // S5: Assign 1 resident (minimum coverage) - reduced to reserve capacity for Pass 2
+  // S5: Assign 2 residents (minimum coverage) - kept at 2 to maintain S2/S5 balance
   let s5Count = 0;
-  const s5MinCount = 1;
+  const s5MinCount = 2;
   
   while (s5Count < s5MinCount) {
     const eligible = findEligibleResident(residents, date, site, 'S5', schedule, false);
