@@ -58,6 +58,7 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('Resident Scheduler')
     .addItem('Auto-Schedule Shifts', 'autoScheduleShifts')
+    .addItem('Optimize Day/Night Balance', 'optimizeDayNightBalance')
     .addItem('Clear All Schedules', 'clearAllSchedules')
     .addItem('Validate Schedule', 'validateSchedule')
     .addItem('Setup Validation Formulas', 'setupValidationFormulas')
@@ -1108,4 +1109,396 @@ CONSTRAINTS:
 For more details, see the documentation files.`;
   
   ui.alert('Help', helpText, ui.ButtonSet.OK);
+}
+
+/**
+ * Optimize Day/Night Balance - Swap residents to balance distribution
+ */
+function optimizeDayNightBalance() {
+  const ui = SpreadsheetApp.getUi();
+  const result = ui.alert(
+    'Optimize Day/Night Balance',
+    'This will analyze the schedule and attempt to swap residents between day and night shifts to improve balance. Continue?',
+    ui.ButtonSet.YES_NO
+  );
+  
+  if (result !== ui.Button.YES) {
+    return;
+  }
+  
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  
+  try {
+    // Load current schedule
+    const residents = loadResidents(sheet);
+    loadExistingConstraints(sheet, residents);
+    const dates = loadDates(sheet);
+    
+    // Load actual shift assignments from sheet
+    loadCurrentSchedule(sheet, residents);
+    
+    // Analyze current distribution
+    const currentDistribution = analyzeDayNightDistribution(residents, dates);
+    
+    // Find problem days
+    const problemDays = identifyProblemDays(currentDistribution);
+    
+    if (problemDays.length === 0) {
+      ui.alert('No Issues Found', 'The day/night distribution looks balanced. No optimization needed!', ui.ButtonSet.OK);
+      return;
+    }
+    
+    Logger.log('Found ' + problemDays.length + ' problem days: ' + problemDays.map(d => d.index).join(', '));
+    
+    // Find and evaluate potential swaps
+    const swapCandidates = findSwapCandidates(residents, dates, currentDistribution);
+    
+    if (swapCandidates.length === 0) {
+      ui.alert('No Swaps Available', 'Could not find any valid resident swaps that would improve the distribution.', ui.ButtonSet.OK);
+      return;
+    }
+    
+    // Evaluate each swap
+    const evaluatedSwaps = evaluateSwaps(swapCandidates, residents, dates, currentDistribution);
+    
+    // Sort by improvement score
+    evaluatedSwaps.sort((a, b) => b.improvement - a.improvement);
+    
+    // Take the best swap
+    const bestSwap = evaluatedSwaps[0];
+    
+    if (bestSwap.improvement <= 0) {
+      ui.alert('No Improvement', 'Found potential swaps but none would improve the distribution.', ui.ButtonSet.OK);
+      return;
+    }
+    
+    // Show results to user
+    const message = `Found optimization opportunity!\n\n` +
+      `Swap: ${bestSwap.residentA.name} ↔ ${bestSwap.residentB.name}\n\n` +
+      `${bestSwap.residentA.name}: ${bestSwap.residentA.nightShiftCount} nights → ${bestSwap.residentB.nightShiftCount} nights\n` +
+      `${bestSwap.residentB.name}: ${bestSwap.residentB.nightShiftCount} nights → ${bestSwap.residentA.nightShiftCount} nights\n\n` +
+      `Problem days before: ${problemDays.length}\n` +
+      `Problem days after: ${bestSwap.problemDaysAfter}\n` +
+      `Improvement score: +${bestSwap.improvement.toFixed(1)}\n\n` +
+      `Apply this swap?`;
+    
+    const confirmResult = ui.alert('Optimization Found', message, ui.ButtonSet.YES_NO);
+    
+    if (confirmResult === ui.Button.YES) {
+      // Apply the swap
+      applySwap(sheet, bestSwap.residentA, bestSwap.residentB);
+      ui.alert('Success', 'Swap applied successfully! Please review the updated schedule.', ui.ButtonSet.OK);
+    }
+    
+  } catch (error) {
+    ui.alert('Error', 'Optimization failed: ' + error.message, ui.ButtonSet.OK);
+    Logger.log('Error in optimizeDayNightBalance: ' + error.message);
+    Logger.log(error.stack);
+  }
+}
+
+/**
+ * Load current schedule from sheet into resident objects
+ */
+function loadCurrentSchedule(sheet, residents) {
+  for (let resident of residents) {
+    for (let col = CONFIG.FIRST_DAY_COL; col <= CONFIG.LAST_DAY_COL; col++) {
+      const dayIndex = col - CONFIG.FIRST_DAY_COL;
+      const value = sheet.getRange(resident.row, col).getValue();
+      
+      // Skip PTO and Request
+      if (value === 'PTO' || value === 'Request' || value === '') {
+        continue;
+      }
+      
+      // Store shift assignment
+      resident.schedule[dayIndex] = `${resident.site}-${value}`;
+      resident.assignedShifts++;
+      
+      // Count shift types
+      if (value === 'S1' || value === 'S2') {
+        resident.morningShiftCount++;
+        resident.isMorningWorker = true;
+      } else if (value === 'S4' || value === 'S5') {
+        resident.nightShiftCount++;
+        resident.isNightWorker = true;
+      } else if (value === 'S3') {
+        resident.afternoonShiftCount++;
+        resident.isMorningWorker = true;
+      }
+    }
+  }
+}
+
+/**
+ * Analyze day/night distribution per day
+ */
+function analyzeDayNightDistribution(residents, dates) {
+  const distribution = [];
+  
+  for (let date of dates) {
+    let dayShifts = 0;
+    let nightShifts = 0;
+    
+    for (let resident of residents) {
+      if (resident.schedule[date.index]) {
+        const shift = resident.schedule[date.index].split('-')[1];
+        
+        if (CONFIG.NIGHT_SHIFTS.includes(shift)) {
+          nightShifts++;
+        } else {
+          dayShifts++;
+        }
+      }
+    }
+    
+    distribution.push({
+      index: date.index,
+      date: date.date,
+      dayName: date.dayName,
+      dayShifts: dayShifts,
+      nightShifts: nightShifts,
+      isBalanced: isDistributionBalanced(dayShifts, nightShifts)
+    });
+  }
+  
+  return distribution;
+}
+
+/**
+ * Check if day/night distribution is balanced
+ */
+function isDistributionBalanced(dayShifts, nightShifts) {
+  // Allow some flexibility
+  // Warning if: ratio > 3:1 or one side is 0
+  if (nightShifts === 0 && dayShifts > 0) return false;
+  if (dayShifts === 0 && nightShifts > 0) return false; // Wednesday is OK
+  if (dayShifts === 0 && nightShifts === 0) return true; // No shifts is OK
+  
+  const ratio = Math.max(dayShifts, nightShifts) / Math.min(dayShifts, nightShifts);
+  return ratio <= 2.5; // Allow up to 2.5:1 ratio
+}
+
+/**
+ * Identify problem days with imbalanced distribution
+ */
+function identifyProblemDays(distribution) {
+  return distribution.filter(d => !d.isBalanced);
+}
+
+/**
+ * Find potential resident pairs for swapping
+ */
+function findSwapCandidates(residents, dates, currentDistribution) {
+  const candidates = [];
+  
+  // Only consider Oly residents (same site swaps)
+  const olyResidents = residents.filter(r => r.site === 'Oly' && r.assignedShifts > 0);
+  
+  // Separate into day and night workers
+  const dayWorkers = olyResidents.filter(r => r.isMorningWorker && !r.isNightWorker);
+  const nightWorkers = olyResidents.filter(r => r.isNightWorker && !r.isMorningWorker);
+  
+  Logger.log('Swap candidates: ' + dayWorkers.length + ' day workers, ' + nightWorkers.length + ' night workers');
+  
+  // Try pairing each day worker with each night worker
+  for (let dayWorker of dayWorkers) {
+    for (let nightWorker of nightWorkers) {
+      // Must have similar shift counts (within 3)
+      if (Math.abs(dayWorker.assignedShifts - nightWorker.assignedShifts) > 3) {
+        continue;
+      }
+      
+      // Must be same class (to maintain class distribution)
+      if (dayWorker.classType !== nightWorker.classType) {
+        continue;
+      }
+      
+      candidates.push({
+        residentA: dayWorker,
+        residentB: nightWorker
+      });
+    }
+  }
+  
+  Logger.log('Found ' + candidates.length + ' potential swap pairs');
+  return candidates;
+}
+
+/**
+ * Evaluate potential swaps
+ */
+function evaluateSwaps(swapCandidates, residents, dates, currentDistribution) {
+  const evaluated = [];
+  
+  for (let candidate of swapCandidates) {
+    // Create deep copies for simulation
+    const residentACopy = JSON.parse(JSON.stringify(candidate.residentA));
+    const residentBCopy = JSON.parse(JSON.stringify(candidate.residentB));
+    
+    // Check if swap is valid (no PTO conflicts)
+    let valid = true;
+    
+    // Check resident A taking B's schedule
+    for (let dayIndex in residentBCopy.schedule) {
+      if (residentACopy.ptoRequests[dayIndex]) {
+        valid = false;
+        break;
+      }
+    }
+    
+    // Check resident B taking A's schedule
+    for (let dayIndex in residentACopy.schedule) {
+      if (residentBCopy.ptoRequests[dayIndex]) {
+        valid = false;
+        break;
+      }
+    }
+    
+    if (!valid) continue;
+    
+    // Simulate the swap
+    const tempScheduleA = residentACopy.schedule;
+    const tempScheduleB = residentBCopy.schedule;
+    residentACopy.schedule = tempScheduleB;
+    residentBCopy.schedule = tempScheduleA;
+    
+    // Validate 60-hour rule after swap
+    let violates60Hour = false;
+    for (let dayIndex = 0; dayIndex < dates.length; dayIndex++) {
+      if (residentACopy.schedule[dayIndex]) {
+        if (!check60HourRuleForSchedule(residentACopy, dayIndex)) {
+          violates60Hour = true;
+          break;
+        }
+      }
+      if (residentBCopy.schedule[dayIndex]) {
+        if (!check60HourRuleForSchedule(residentBCopy, dayIndex)) {
+          violates60Hour = true;
+          break;
+        }
+      }
+    }
+    
+    if (violates60Hour) continue;
+    
+    // Calculate new distribution
+    const newDistribution = simulateDistributionAfterSwap(
+      residents,
+      dates,
+      candidate.residentA,
+      candidate.residentB
+    );
+    
+    const problemDaysBefore = currentDistribution.filter(d => !d.isBalanced).length;
+    const problemDaysAfter = newDistribution.filter(d => !d.isBalanced).length;
+    const improvement = problemDaysBefore - problemDaysAfter;
+    
+    evaluated.push({
+      residentA: candidate.residentA,
+      residentB: candidate.residentB,
+      problemDaysAfter: problemDaysAfter,
+      improvement: improvement
+    });
+  }
+  
+  return evaluated;
+}
+
+/**
+ * Check 60-hour rule for a resident's schedule
+ */
+function check60HourRuleForSchedule(resident, dayIndex) {
+  for (let startDay = Math.max(0, dayIndex - 6); startDay <= dayIndex; startDay++) {
+    const endDay = Math.min(startDay + 6, CONFIG.LAST_DAY_COL - CONFIG.FIRST_DAY_COL);
+    let hours = 0;
+    
+    for (let d = startDay; d <= endDay; d++) {
+      if (resident.schedule[d] && !resident.ptoRequests[d]) {
+        hours += CONFIG.HOURS_PER_SHIFT;
+      }
+    }
+    
+    if (hours > CONFIG.MAX_HOURS_7_DAYS) {
+      return false;
+    }
+  }
+  
+  return true;
+}
+
+/**
+ * Simulate distribution after a swap
+ */
+function simulateDistributionAfterSwap(residents, dates, residentA, residentB) {
+  const distribution = [];
+  
+  for (let date of dates) {
+    let dayShifts = 0;
+    let nightShifts = 0;
+    
+    for (let resident of residents) {
+      let schedule = resident.schedule;
+      
+      // Use swapped schedule for A and B
+      if (resident.name === residentA.name) {
+        schedule = residentB.schedule;
+      } else if (resident.name === residentB.name) {
+        schedule = residentA.schedule;
+      }
+      
+      if (schedule[date.index]) {
+        const shift = schedule[date.index].split('-')[1];
+        
+        if (CONFIG.NIGHT_SHIFTS.includes(shift)) {
+          nightShifts++;
+        } else {
+          dayShifts++;
+        }
+      }
+    }
+    
+    distribution.push({
+      index: date.index,
+      dayShifts: dayShifts,
+      nightShifts: nightShifts,
+      isBalanced: isDistributionBalanced(dayShifts, nightShifts)
+    });
+  }
+  
+  return distribution;
+}
+
+/**
+ * Apply the swap to the sheet
+ */
+function applySwap(sheet, residentA, residentB) {
+  // Store A's schedule temporarily
+  const scheduleA = [];
+  for (let col = CONFIG.FIRST_DAY_COL; col <= CONFIG.LAST_DAY_COL; col++) {
+    const value = sheet.getRange(residentA.row, col).getValue();
+    scheduleA.push(value);
+  }
+  
+  // Copy B's schedule to A's row
+  for (let col = CONFIG.FIRST_DAY_COL; col <= CONFIG.LAST_DAY_COL; col++) {
+    const value = sheet.getRange(residentB.row, col).getValue();
+    // Only copy shift assignments, preserve PTO/Request
+    const dayIndex = col - CONFIG.FIRST_DAY_COL;
+    if (!residentA.ptoRequests[dayIndex]) {
+      sheet.getRange(residentA.row, col).setValue(value);
+    }
+  }
+  
+  // Copy A's schedule to B's row
+  for (let col = CONFIG.FIRST_DAY_COL; col <= CONFIG.LAST_DAY_COL; col++) {
+    const value = scheduleA[col - CONFIG.FIRST_DAY_COL];
+    // Only copy shift assignments, preserve PTO/Request
+    const dayIndex = col - CONFIG.FIRST_DAY_COL;
+    if (!residentB.ptoRequests[dayIndex]) {
+      sheet.getRange(residentB.row, col).setValue(value);
+    }
+  }
+  
+  Logger.log('Swapped schedules: ' + residentA.name + ' ↔ ' + residentB.name);
 }
